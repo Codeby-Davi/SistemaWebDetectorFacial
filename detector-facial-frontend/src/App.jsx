@@ -8,13 +8,14 @@ export default function App() {
   const canvasOcultoRef = useRef(null);
   const canvasOverlayRef = useRef(null);
 
-  // Refs para manejo fluido sin provocar re-renderizados innecesarios
   const procesandoRef = useRef(false);
   const cajaObjetivoRef = useRef(null);
   const cajaSuavizadaRef = useRef(null);
   const datosDeteccionRef = useRef(null);
+  const modoActivoRef = useRef("rostro");
 
-  const [estadoCamara, setEstadoCamara] = useState("solicitando"); // solicitando | activa | error
+  const [modoActivo, setModoActivo] = useState("rostro");
+  const [estadoCamara, setEstadoCamara] = useState("solicitando");
   const [camaraPausada, setCamaraPausada] = useState(false);
   const [apiConectada, setApiConectada] = useState(false);
   const [latenciaMs, setLatenciaMs] = useState(0);
@@ -25,41 +26,39 @@ export default function App() {
     confianza: 0,
   });
 
-  // 1. Solicitar permiso y encender la webcam al abrir la página
+  const cambiarModo = (nuevoModo) => {
+    setModoActivo(nuevoModo);
+    modoActivoRef.current = nuevoModo;
+    // Si el video está pausado, analizamos de inmediato la imagen congelada con el nuevo módulo
+    if (camaraPausada) {
+      enviarFrameAlBackend();
+    }
+  };
+
   useEffect(() => {
     let stream = null;
-
     async function iniciarCamara() {
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
           audio: false,
         });
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-        }
+        if (videoRef.current) videoRef.current.srcObject = stream;
         setEstadoCamara("activa");
       } catch (err) {
         console.error("Error de cámara:", err);
         setEstadoCamara("error");
       }
     }
-
     iniciarCamara();
-
     return () => {
       if (stream) stream.getTracks().forEach((track) => track.stop());
     };
   }, []);
 
-  // 2. Bucle de envío de fotogramas hacia Python (~10 FPS para máxima fluidez)
   useEffect(() => {
     if (estadoCamara !== "activa" || camaraPausada) return;
-
-    const intervalo = setInterval(() => {
-      enviarFrameAlBackend();
-    }, 100);
-
+    const intervalo = setInterval(() => enviarFrameAlBackend(), 100);
     return () => clearInterval(intervalo);
   }, [estadoCamara, camaraPausada]);
 
@@ -72,7 +71,6 @@ export default function App() {
     const inicio = performance.now();
 
     try {
-      // Reducimos a 320px de ancho para que la transferencia sea casi instantánea
       const anchoEnvio = 320;
       const altoEnvio = Math.round((video.videoHeight / video.videoWidth) * anchoEnvio) || 240;
       canvas.width = anchoEnvio;
@@ -84,6 +82,7 @@ export default function App() {
       const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.75));
       const formData = new FormData();
       formData.append("file", blob, "frame.jpg");
+      formData.append("modo", modoActivoRef.current);
 
       const respuesta = await fetch(API_URL, { method: "POST", body: formData });
       if (!respuesta.ok) throw new Error("Error HTTP");
@@ -95,7 +94,7 @@ export default function App() {
       datosDeteccionRef.current = data;
 
       if (data.rostro_detectado && data.caja) {
-        cajaObjetivoRef.current = data.caja; // Coordenadas normalizadas { x, y, w, h }
+        cajaObjetivoRef.current = data.caja;
       } else {
         cajaObjetivoRef.current = null;
       }
@@ -107,7 +106,6 @@ export default function App() {
     }
   };
 
-  // 3. Bucle visual a 60 FPS: interpola la posición del cuadro para evitar saltos al moverse
   useEffect(() => {
     let animationFrameId;
 
@@ -126,12 +124,12 @@ export default function App() {
 
         const objetivo = cajaObjetivoRef.current;
 
-        if (!objetivo || camaraPausada) {
+        // Mantenemos el recuadro visible incluso cuando camaraPausada es true
+        if (!objetivo) {
           cajaSuavizadaRef.current = null;
-        } else if (!cajaSuavizadaRef.current) {
+        } else if (!cajaSuavizadaRef.current || camaraPausada) {
           cajaSuavizadaRef.current = { ...objetivo };
         } else {
-          // Factor 0.3: suaviza el movimiento sin dejar rastro lento
           const f = 0.3;
           cajaSuavizadaRef.current.x += (objetivo.x - cajaSuavizadaRef.current.x) * f;
           cajaSuavizadaRef.current.y += (objetivo.y - cajaSuavizadaRef.current.y) * f;
@@ -142,34 +140,62 @@ export default function App() {
         if (cajaSuavizadaRef.current && datosDeteccionRef.current) {
           const { x, y, w, h } = cajaSuavizadaRef.current;
           const data = datosDeteccionRef.current;
+          const modo = modoActivoRef.current;
 
-          // Invertimos X matemáticamente porque el video está en modo espejo (scaleX(-1))
           const drawX = (1 - (x + w)) * overlay.width;
           const drawY = y * overlay.height;
           const drawW = w * overlay.width;
           const drawH = h * overlay.height;
 
-          // Esquinas estilizadas de escáner
-          ctx.strokeStyle = "#10b981";
-          ctx.lineWidth = 3;
+          // 1. Recuadro base del rostro
+          ctx.strokeStyle = modo === "rostro" ? "#10b981" : "rgba(148, 163, 184, 0.45)";
+          ctx.lineWidth = modo === "rostro" ? 3 : 1.5;
           ctx.beginPath();
           ctx.roundRect(drawX, drawY, drawW, drawH, 10);
           ctx.stroke();
 
-          // Etiqueta superior legible (no invertida)
-          const texto = `${data.con_lentes ? "Con Lentes" : "Sin Lentes"} • ${
-            data.con_mascarilla ? "Con Mascarilla" : "Sin Mascarilla"
-          }`;
+          // 2. Recuadro específico del apartado activo
+          if (data.caja_detalle && (modo === "lentes" || modo === "mascarilla")) {
+            const det = data.caja_detalle;
+            const detX = (1 - (det.x + det.w)) * overlay.width;
+            const detY = det.y * overlay.height;
+            const detW = det.w * overlay.width;
+            const detH = det.h * overlay.height;
+
+            const activoDetalle = modo === "lentes" ? data.con_lentes : data.con_mascarilla;
+            ctx.strokeStyle = activoDetalle ? "#10b981" : "#3b82f6";
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.roundRect(detX, detY, detW, detH, 8);
+            ctx.stroke();
+          }
+
+          // 3. Etiqueta dinámica
+          let texto = "Rostro Detectado";
+          let colorTexto = "#34d399";
+
+          if (modo === "lentes") {
+            texto = data.con_lentes ? "✔ Con Lentes" : "✖ Sin Lentes";
+            colorTexto = data.con_lentes ? "#34d399" : "#60a5fa";
+          } else if (modo === "mascarilla") {
+            texto = data.con_mascarilla ? "✔ Con Mascarilla / Cubierto" : "✖ Sin Mascarilla";
+            colorTexto = data.con_mascarilla ? "#34d399" : "#60a5fa";
+          }
+
+          if (camaraPausada) {
+            texto += " (Pausado)";
+          }
+
           ctx.font = "600 15px system-ui, sans-serif";
           const anchoTexto = ctx.measureText(texto).width + 20;
           const etiquetaY = Math.max(8, drawY - 34);
 
-          ctx.fillStyle = "rgba(15, 23, 42, 0.85)";
+          ctx.fillStyle = "rgba(15, 23, 42, 0.88)";
           ctx.beginPath();
           ctx.roundRect(drawX, etiquetaY, anchoTexto, 28, 6);
           ctx.fill();
 
-          ctx.fillStyle = "#34d399";
+          ctx.fillStyle = colorTexto;
           ctx.fillText(texto, drawX + 10, etiquetaY + 19);
         }
       }
@@ -190,6 +216,8 @@ export default function App() {
     } else {
       video.pause();
       setCamaraPausada(true);
+      // Analiza la imagen congelada inmediatamente al pausar
+      enviarFrameAlBackend();
     }
   };
 
@@ -198,8 +226,45 @@ export default function App() {
       <header className="topbar">
         <div>
           <h1>Visión Artificial • Detección Facial</h1>
-          <p className="subtitulo">Procesamiento en tiempo real con OpenCV & MediaPipe</p>
+          <p className="subtitulo">Módulos independientes de análisis en tiempo real</p>
         </div>
+
+        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+          <button
+            onClick={() => cambiarModo("rostro")}
+            className="btn-control"
+            style={{
+              background: modoActivo === "rostro" ? "#10b981" : "#1e293b",
+              color: modoActivo === "rostro" ? "#052e16" : "#f1f5f9",
+              borderColor: modoActivo === "rostro" ? "#10b981" : "#334155",
+            }}
+          >
+            1. Detector de Rostro
+          </button>
+          <button
+            onClick={() => cambiarModo("lentes")}
+            className="btn-control"
+            style={{
+              background: modoActivo === "lentes" ? "#10b981" : "#1e293b",
+              color: modoActivo === "lentes" ? "#052e16" : "#f1f5f9",
+              borderColor: modoActivo === "lentes" ? "#10b981" : "#334155",
+            }}
+          >
+            2. Detector de Lentes
+          </button>
+          <button
+            onClick={() => cambiarModo("mascarilla")}
+            className="btn-control"
+            style={{
+              background: modoActivo === "mascarilla" ? "#10b981" : "#1e293b",
+              color: modoActivo === "mascarilla" ? "#052e16" : "#f1f5f9",
+              borderColor: modoActivo === "mascarilla" ? "#10b981" : "#334155",
+            }}
+          >
+            3. Mascarilla / Mano
+          </button>
+        </div>
+
         <div className={`pill-conexion ${apiConectada ? "online" : "offline"}`}>
           <span className="punto"></span>
           {apiConectada ? `API Conectada (${latenciaMs} ms)` : "Esperando Backend Python..."}
@@ -207,7 +272,6 @@ export default function App() {
       </header>
 
       <main className="contenido-principal">
-        {/* Visor de Cámara */}
         <section className="visor-card">
           <div className="video-wrapper">
             {estadoCamara === "solicitando" && (
@@ -237,41 +301,64 @@ export default function App() {
           </div>
         </section>
 
-        {/* Panel de Resultados en Vivo */}
         <aside className="panel-resultados">
-          <h2>Resultados en Tiempo Real</h2>
+          <h2>
+            {modoActivo === "rostro" && "Módulo: Detección de Rostro"}
+            {modoActivo === "lentes" && "Módulo: Detección de Lentes"}
+            {modoActivo === "mascarilla" && "Módulo: Mascarilla / Mano"}
+          </h2>
 
-          <TarjetaIndicador
-            titulo="Estado del Rostro"
-            valor={resultado.rostro_detectado ? "Rostro Detectado" : "Buscando rostro..."}
-            activo={resultado.rostro_detectado}
-          />
+          {modoActivo === "rostro" && (
+            <TarjetaIndicador
+              titulo="Estado del Rostro"
+              valor={resultado.rostro_detectado ? "Rostro Detectado" : "Buscando rostro..."}
+              activo={resultado.rostro_detectado}
+            />
+          )}
 
-          <TarjetaIndicador
-            titulo="Detección de Lentes"
-            valor={
-              !resultado.rostro_detectado
-                ? "Sin lectura"
-                : resultado.con_lentes
-                ? "Con Lentes"
-                : "Sin Lentes"
-            }
-            activo={resultado.rostro_detectado && resultado.con_lentes}
-            neutro={!resultado.rostro_detectado}
-          />
+          {modoActivo === "lentes" && (
+            <>
+              <TarjetaIndicador
+                titulo="Rostro Base"
+                valor={resultado.rostro_detectado ? "Localizado" : "Buscando..."}
+                activo={resultado.rostro_detectado}
+              />
+              <TarjetaIndicador
+                titulo="Lectura de Lentes"
+                valor={
+                  !resultado.rostro_detectado
+                    ? "Sin lectura"
+                    : resultado.con_lentes
+                    ? "Con Lentes"
+                    : "Sin Lentes"
+                }
+                activo={resultado.rostro_detectado && resultado.con_lentes}
+                neutro={!resultado.rostro_detectado}
+              />
+            </>
+          )}
 
-          <TarjetaIndicador
-            titulo="Detección de Mascarilla"
-            valor={
-              !resultado.rostro_detectado
-                ? "Sin lectura"
-                : resultado.con_mascarilla
-                ? "Con Mascarilla"
-                : "Sin Mascarilla"
-            }
-            activo={resultado.rostro_detectado && resultado.con_mascarilla}
-            neutro={!resultado.rostro_detectado}
-          />
+          {modoActivo === "mascarilla" && (
+            <>
+              <TarjetaIndicador
+                titulo="Rostro Base"
+                valor={resultado.rostro_detectado ? "Localizado" : "Buscando..."}
+                activo={resultado.rostro_detectado}
+              />
+              <TarjetaIndicador
+                titulo="Lectura de Mascarilla / Mano"
+                valor={
+                  !resultado.rostro_detectado
+                    ? "Sin lectura"
+                    : resultado.con_mascarilla
+                    ? "Mascarilla / Cubierto"
+                    : "Descubierto"
+                }
+                activo={resultado.rostro_detectado && resultado.con_mascarilla}
+                neutro={!resultado.rostro_detectado}
+              />
+            </>
+          )}
         </aside>
       </main>
     </div>
