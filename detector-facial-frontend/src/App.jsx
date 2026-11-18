@@ -3,6 +3,27 @@ import "./App.css";
 
 const API_URL = "http://localhost:8000/api/detectar";
 
+const MODULOS = [
+  {
+    id: "rostro",
+    numero: "01",
+    titulo: "Detector de Rostro",
+    descripcion: "Localización base de malla facial (468 puntos)",
+  },
+  {
+    id: "lentes",
+    numero: "02",
+    titulo: "Detector de Lentes",
+    descripcion: "Análisis estructural de puente, aros y patillas",
+  },
+  {
+    id: "mascarilla",
+    numero: "03",
+    titulo: "Mascarilla / Mano",
+    descripcion: "Detección de oclusión facial y proximidad",
+  },
+];
+
 export default function App() {
   const videoRef = useRef(null);
   const canvasOcultoRef = useRef(null);
@@ -29,7 +50,6 @@ export default function App() {
   const cambiarModo = (nuevoModo) => {
     setModoActivo(nuevoModo);
     modoActivoRef.current = nuevoModo;
-    // Si el video está pausado, analizamos de inmediato la imagen congelada con el nuevo módulo
     if (camaraPausada) {
       enviarFrameAlBackend();
     }
@@ -37,21 +57,46 @@ export default function App() {
 
   useEffect(() => {
     let stream = null;
+    let cancelado = false;
+
     async function iniciarCamara() {
       try {
+        // Pequeña pausa de 150ms para que Windows libere la webcam tras un Hot Reload de Vite
+        await new Promise((r) => setTimeout(r, 150));
+        if (cancelado) return;
+
         stream = await navigator.mediaDevices.getUserMedia({
           video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
           audio: false,
         });
-        if (videoRef.current) videoRef.current.srcObject = stream;
-        setEstadoCamara("activa");
+
+        if (cancelado) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+
+        const video = videoRef.current;
+        if (video) {
+          video.srcObject = stream;
+          video.onloadedmetadata = async () => {
+            try {
+              await video.play();
+              setEstadoCamara("activa");
+            } catch (playErr) {
+              console.error("Error al reproducir video:", playErr);
+            }
+          };
+        }
       } catch (err) {
         console.error("Error de cámara:", err);
-        setEstadoCamara("error");
+        if (!cancelado) setEstadoCamara("error");
       }
     }
+
     iniciarCamara();
+
     return () => {
+      cancelado = true;
       if (stream) stream.getTracks().forEach((track) => track.stop());
     };
   }, []);
@@ -124,7 +169,6 @@ export default function App() {
 
         const objetivo = cajaObjetivoRef.current;
 
-        // Mantenemos el recuadro visible incluso cuando camaraPausada es true
         if (!objetivo) {
           cajaSuavizadaRef.current = null;
         } else if (!cajaSuavizadaRef.current || camaraPausada) {
@@ -147,11 +191,11 @@ export default function App() {
           const drawW = w * overlay.width;
           const drawH = h * overlay.height;
 
-          // 1. Recuadro base del rostro
-          ctx.strokeStyle = modo === "rostro" ? "#10b981" : "rgba(148, 163, 184, 0.45)";
-          ctx.lineWidth = modo === "rostro" ? 3 : 1.5;
+          // 1. Recuadro base del rostro (Jade #7B9669 o Salvia suave #BAC8B1)
+          ctx.strokeStyle = modo === "rostro" ? "#7B9669" : "rgba(186, 200, 177, 0.75)";
+          ctx.lineWidth = modo === "rostro" ? 3 : 1.75;
           ctx.beginPath();
-          ctx.roundRect(drawX, drawY, drawW, drawH, 10);
+          ctx.roundRect(drawX, drawY, drawW, drawH, 12);
           ctx.stroke();
 
           // 2. Recuadro específico del apartado activo
@@ -163,40 +207,44 @@ export default function App() {
             const detH = det.h * overlay.height;
 
             const activoDetalle = modo === "lentes" ? data.con_lentes : data.con_mascarilla;
-            ctx.strokeStyle = activoDetalle ? "#10b981" : "#3b82f6";
+            ctx.strokeStyle = activoDetalle ? "#7B9669" : "#6C8480";
             ctx.lineWidth = 3;
             ctx.beginPath();
             ctx.roundRect(detX, detY, detW, detH, 8);
             ctx.stroke();
           }
 
-          // 3. Etiqueta dinámica
+          // 3. Etiqueta dinámica con fondo Bosque Oscuro (#404E3B)
           let texto = "Rostro Detectado";
-          let colorTexto = "#34d399";
+          let colorBadge = "#7B9669";
 
           if (modo === "lentes") {
             texto = data.con_lentes ? "✔ Con Lentes" : "✖ Sin Lentes";
-            colorTexto = data.con_lentes ? "#34d399" : "#60a5fa";
+            colorBadge = data.con_lentes ? "#7B9669" : "#6C8480";
           } else if (modo === "mascarilla") {
-            texto = data.con_mascarilla ? "✔ Con Mascarilla / Cubierto" : "✖ Sin Mascarilla";
-            colorTexto = data.con_mascarilla ? "#34d399" : "#60a5fa";
+            texto = data.con_mascarilla ? "✔ Mascarilla / Cubierto" : "✖ Descubierto";
+            colorBadge = data.con_mascarilla ? "#7B9669" : "#6C8480";
           }
 
           if (camaraPausada) {
-            texto += " (Pausado)";
+            texto += " • Pausa";
           }
 
-          ctx.font = "600 15px system-ui, sans-serif";
-          const anchoTexto = ctx.measureText(texto).width + 20;
-          const etiquetaY = Math.max(8, drawY - 34);
+          ctx.font = "600 14px system-ui, -apple-system, sans-serif";
+          const anchoTexto = ctx.measureText(texto).width + 24;
+          const etiquetaY = Math.max(10, drawY - 36);
 
-          ctx.fillStyle = "rgba(15, 23, 42, 0.88)";
+          ctx.fillStyle = "#404E3B";
           ctx.beginPath();
-          ctx.roundRect(drawX, etiquetaY, anchoTexto, 28, 6);
+          ctx.roundRect(drawX, etiquetaY, anchoTexto, 28, 8);
           ctx.fill();
 
-          ctx.fillStyle = colorTexto;
-          ctx.fillText(texto, drawX + 10, etiquetaY + 19);
+          ctx.strokeStyle = colorBadge;
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+
+          ctx.fillStyle = "#E6E6E6";
+          ctx.fillText(texto, drawX + 12, etiquetaY + 19);
         }
       }
 
@@ -216,161 +264,205 @@ export default function App() {
     } else {
       video.pause();
       setCamaraPausada(true);
-      // Analiza la imagen congelada inmediatamente al pausar
       enviarFrameAlBackend();
     }
   };
 
+  const moduloActualInfo = MODULOS.find((m) => m.id === modoActivo);
+  const porcentajeConfianza = resultado.rostro_detectado
+    ? Math.round((resultado.confianza || 0) * 100)
+    : 0;
+
   return (
-    <div className="layout">
-      <header className="topbar">
-        <div>
-          <h1>Visión Artificial • Detección Facial</h1>
-          <p className="subtitulo">Módulos independientes de análisis en tiempo real</p>
+    <div className="app-shell">
+      {/* Barra Lateral Izquierda (#404E3B) */}
+      <aside className="sidebar">
+        <div className="brand-box">
+          <div className="brand-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M3 7V5a2 2 0 0 1 2-2h2" />
+              <path d="M17 3h2a2 2 0 0 1 2 2v2" />
+              <path d="M21 17v2a2 2 0 0 1-2 2h-2" />
+              <path d="M7 21H5a2 2 0 0 1-2-2v-2" />
+              <circle cx="12" cy="10" r="3" />
+              <path d="M7 18a5 5 0 0 1 10 0" />
+            </svg>
+          </div>
+          <div>
+            <span className="brand-tag">Detector Artificial</span>
+            <h1 className="brand-title">Grupo #4</h1>
+          </div>
         </div>
 
-        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-          <button
-            onClick={() => cambiarModo("rostro")}
-            className="btn-control"
-            style={{
-              background: modoActivo === "rostro" ? "#10b981" : "#1e293b",
-              color: modoActivo === "rostro" ? "#052e16" : "#f1f5f9",
-              borderColor: modoActivo === "rostro" ? "#10b981" : "#334155",
-            }}
-          >
-            1. Detector de Rostro
-          </button>
-          <button
-            onClick={() => cambiarModo("lentes")}
-            className="btn-control"
-            style={{
-              background: modoActivo === "lentes" ? "#10b981" : "#1e293b",
-              color: modoActivo === "lentes" ? "#052e16" : "#f1f5f9",
-              borderColor: modoActivo === "lentes" ? "#10b981" : "#334155",
-            }}
-          >
-            2. Detector de Lentes
-          </button>
-          <button
-            onClick={() => cambiarModo("mascarilla")}
-            className="btn-control"
-            style={{
-              background: modoActivo === "mascarilla" ? "#10b981" : "#1e293b",
-              color: modoActivo === "mascarilla" ? "#052e16" : "#f1f5f9",
-              borderColor: modoActivo === "mascarilla" ? "#10b981" : "#334155",
-            }}
-          >
-            3. Mascarilla / Mano
-          </button>
-        </div>
+        <nav className="nav-modulos" aria-label="Módulos de detección">
+          <span className="nav-label">MÓDULOS DE ANÁLISIS</span>
+          {MODULOS.map((mod) => {
+            const activo = modoActivo === mod.id;
+            return (
+              <button
+                key={mod.id}
+                onClick={() => cambiarModo(mod.id)}
+                className={`nav-item ${activo ? "activo" : ""}`}
+              >
+                <span className="nav-num">{mod.numero}</span>
+                <div className="nav-texto">
+                  <strong>{mod.titulo}</strong>
+                  <small>{mod.descripcion}</small>
+                </div>
+              </button>
+            );
+          })}
+        </nav>
 
-        <div className={`pill-conexion ${apiConectada ? "online" : "offline"}`}>
-          <span className="punto"></span>
-          {apiConectada ? `API Conectada (${latenciaMs} ms)` : "Esperando Backend Python..."}
+        <div className="sidebar-footer">
+          <div className={`status-banner ${apiConectada ? "online" : "offline"}`}>
+            <span className="status-dot"></span>
+            <div className="status-info">
+              <strong>{apiConectada ? "Servidor Activo" : "Sin Conexión a Python"}</strong>
+              <span>{apiConectada ? `Respuesta en ${latenciaMs} ms` : "Servidor desconectado"}</span>
+            </div>
+          </div>
         </div>
-      </header>
+      </aside>
 
-      <main className="contenido-principal">
-        <section className="visor-card">
-          <div className="video-wrapper">
+      {/* Área Principal (#E6E6E6) */}
+      <main className="workspace">
+        <header className="workspace-header">
+          <div>
+            <div className="breadcrumb">
+              Módulo {moduloActualInfo.numero} / <span>Análisis en Tiempo Real</span>
+            </div>
+            <h2>{moduloActualInfo.titulo}</h2>
+          </div>
+
+          <div className="header-actions">
+            <button
+              onClick={alternarPausa}
+              className={`btn-accion ${camaraPausada ? "reanudar" : ""}`}
+              disabled={estadoCamara !== "activa"}
+            >
+              {camaraPausada ? (
+                <>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                    <polygon points="5 3 19 12 5 21 5 3" />
+                  </svg>
+                  Reanudar Cámara
+                </>
+              ) : (
+                <>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                    <rect x="6" y="4" width="4" height="16" />
+                    <rect x="14" y="4" width="4" height="16" />
+                  </svg>
+                  Pausar Captura
+                </>
+              )}
+            </button>
+          </div>
+        </header>
+
+        {/* Contenedor del Visor Óptico */}
+        <section className="stage-card">
+          <div className="video-frame">
+            {/* Guías estéticas de encuadre en las esquinas */}
+            <span className="corner tl"></span>
+            <span className="corner tr"></span>
+            <span className="corner bl"></span>
+            <span className="corner br"></span>
+
             {estadoCamara === "solicitando" && (
-              <div className="mensaje-estado">Solicitando acceso a la cámara...</div>
+              <div className="cam-placeholder">Solicitando acceso a la cámara web...</div>
             )}
             {estadoCamara === "error" && (
-              <div className="mensaje-estado error">
-                No se pudo acceder a la cámara. Verifica los permisos del navegador.
+              <div className="cam-placeholder error">
+                No se pudo acceder a la cámara. Revisa los permisos de tu navegador.
               </div>
             )}
 
-            <video ref={videoRef} autoPlay playsInline muted className="video-espejo" />
-            <canvas ref={canvasOverlayRef} className="canvas-overlay" />
+            <video ref={videoRef} autoPlay playsInline muted className="video-feed" />
+            <canvas ref={canvasOverlayRef} className="overlay-canvas" />
             <canvas ref={canvasOcultoRef} style={{ display: "none" }} />
-          </div>
 
-          <div className="controles-barra">
-            <button onClick={alternarPausa} className="btn-control" disabled={estadoCamara !== "activa"}>
-              {camaraPausada ? "▶ Reanudar Detección" : "⏸ Pausar Cámara"}
-            </button>
-            <span className="info-confianza">
-              Confianza del modelo:{" "}
-              <strong>
-                {resultado.rostro_detectado ? `${Math.round((resultado.confianza || 0) * 100)}%` : "—"}
-              </strong>
-            </span>
+            <div className="live-pill">
+              <span className={`rec-dot ${camaraPausada ? "paused" : ""}`}></span>
+              {camaraPausada ? "IMAGEN CONGELADA" : "EN VIVO • 60 FPS"}
+            </div>
           </div>
         </section>
 
-        <aside className="panel-resultados">
-          <h2>
-            {modoActivo === "rostro" && "Módulo: Detección de Rostro"}
-            {modoActivo === "lentes" && "Módulo: Detección de Lentes"}
-            {modoActivo === "mascarilla" && "Módulo: Mascarilla / Mano"}
-          </h2>
+        {/* Fila Inferior de Diagnóstico y Telemetría */}
+        <section className="metrics-grid">
+          <div className={`metric-card ${resultado.rostro_detectado ? "jade" : "slate"}`}>
+            <span className="metric-label">Rostro Base (MediaPipe)</span>
+            <strong className="metric-value">
+              {resultado.rostro_detectado ? "Localizado" : "Buscando sujeto..."}
+            </strong>
+            <span className="metric-sub">Seguimiento facial activo</span>
+          </div>
 
           {modoActivo === "rostro" && (
-            <TarjetaIndicador
-              titulo="Estado del Rostro"
-              valor={resultado.rostro_detectado ? "Rostro Detectado" : "Buscando rostro..."}
-              activo={resultado.rostro_detectado}
-            />
+            <div className={`metric-card ${resultado.rostro_detectado ? "jade" : "neutral"}`}>
+              <span className="metric-label">Estado de Captura</span>
+              <strong className="metric-value">
+                {resultado.rostro_detectado ? "Encuadre Óptimo" : "Sin Sujeto"}
+              </strong>
+              <span className="metric-sub">Listo para inspección de atributos</span>
+            </div>
           )}
 
           {modoActivo === "lentes" && (
-            <>
-              <TarjetaIndicador
-                titulo="Rostro Base"
-                valor={resultado.rostro_detectado ? "Localizado" : "Buscando..."}
-                activo={resultado.rostro_detectado}
-              />
-              <TarjetaIndicador
-                titulo="Lectura de Lentes"
-                valor={
-                  !resultado.rostro_detectado
-                    ? "Sin lectura"
-                    : resultado.con_lentes
-                    ? "Con Lentes"
-                    : "Sin Lentes"
-                }
-                activo={resultado.rostro_detectado && resultado.con_lentes}
-                neutro={!resultado.rostro_detectado}
-              />
-            </>
+            <div
+              className={`metric-card ${
+                !resultado.rostro_detectado ? "neutral" : resultado.con_lentes ? "jade" : "slate"
+              }`}
+            >
+              <span className="metric-label">Diagnóstico de Lentes</span>
+              <strong className="metric-value">
+                {!resultado.rostro_detectado
+                  ? "Esperando rostro"
+                  : resultado.con_lentes
+                  ? "Con Lentes"
+                  : "Sin Lentes"}
+              </strong>
+              <span className="metric-sub">Puente nasal, aros y sienes</span>
+            </div>
           )}
 
           {modoActivo === "mascarilla" && (
-            <>
-              <TarjetaIndicador
-                titulo="Rostro Base"
-                valor={resultado.rostro_detectado ? "Localizado" : "Buscando..."}
-                activo={resultado.rostro_detectado}
-              />
-              <TarjetaIndicador
-                titulo="Lectura de Mascarilla / Mano"
-                valor={
-                  !resultado.rostro_detectado
-                    ? "Sin lectura"
-                    : resultado.con_mascarilla
-                    ? "Mascarilla / Cubierto"
-                    : "Descubierto"
-                }
-                activo={resultado.rostro_detectado && resultado.con_mascarilla}
-                neutro={!resultado.rostro_detectado}
-              />
-            </>
+            <div
+              className={`metric-card ${
+                !resultado.rostro_detectado ? "neutral" : resultado.con_mascarilla ? "jade" : "slate"
+              }`}
+            >
+              <span className="metric-label">Diagnóstico de Mascarilla / Mano</span>
+              <strong className="metric-value">
+                {!resultado.rostro_detectado
+                  ? "Esperando rostro"
+                  : resultado.con_mascarilla
+                  ? "Mascarilla / Cubierto"
+                  : "Rostro Descubierto"}
+              </strong>
+              <span className="metric-sub">Análisis cromático YCrCb + Hands</span>
+            </div>
           )}
-        </aside>
-      </main>
-    </div>
-  );
-}
 
-function TarjetaIndicador({ titulo, valor, activo, neutro = false }) {
-  const claseEstado = neutro ? "neutro" : activo ? "positivo" : "negativo";
-  return (
-    <div className={`indicador-card ${claseEstado}`}>
-      <span className="indicador-titulo">{titulo}</span>
-      <strong className="indicador-valor">{valor}</strong>
+          <div className="metric-card confidence-card">
+            <div className="conf-header">
+              <span className="metric-label">Precisión del Modelo</span>
+              <strong className="conf-number">
+                {resultado.rostro_detectado ? `${porcentajeConfianza}%` : "0%"}
+              </strong>
+            </div>
+            <div className="progress-track">
+              <div
+                className="progress-fill"
+                style={{ width: `${porcentajeConfianza}%` }}
+              ></div>
+            </div>
+            <span className="metric-sub">OpenCV + MediaPipe FaceMesh</span>
+          </div>
+        </section>
+      </main>
     </div>
   );
 }
