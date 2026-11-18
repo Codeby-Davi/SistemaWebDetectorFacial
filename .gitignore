@@ -1,0 +1,15 @@
+cat << 'EOF' > .gitignore
+# Entornos virtuales y caché de Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Dependencias y compilados de React / Vite
+node_modules/
+dist/
+
+# Variables de entorno y sistema
+.env
+.DS_Store
+EOF
