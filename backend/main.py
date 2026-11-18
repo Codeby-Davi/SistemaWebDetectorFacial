@@ -2,9 +2,8 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from collections import deque
 import cv2
+import mediapipe as mp
 import numpy as np
-import os
-import urllib.request
 
 app = FastAPI()
 
@@ -16,177 +15,272 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(BASE_DIR, "modelos")
-os.makedirs(MODELS_DIR, exist_ok=True)
+# 1. Modelo de malla facial (468 puntos + iris refinados)
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(
+    static_image_mode=False,
+    max_num_faces=1,
+    refine_landmarks=True,
+    min_detection_confidence=0.65,
+    min_tracking_confidence=0.65,
+)
 
-ARCHIVOS_XML = {
-    "face": ("haarcascade_frontalface_default.xml", "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"),
-    "glasses": ("haarcascade_eye_tree_eyeglasses.xml", "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_eye_tree_eyeglasses.xml"),
-}
+# 2. Modelo de detección de manos (para detectar cuando te tapas la boca con la mano)
+mp_hands = mp.solutions.hands
+hands_detector = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=2,
+    model_complexity=0,  # Rápido en CPU (~5 ms)
+    min_detection_confidence=0.55,
+    min_tracking_confidence=0.55,
+)
 
-rutas_xml = {}
-for clave, (nombre, url) in ARCHIVOS_XML.items():
-    ruta_local = os.path.join(MODELS_DIR, nombre)
-    if not os.path.exists(ruta_local):
-        urllib.request.urlretrieve(url, ruta_local)
-    rutas_xml[clave] = ruta_local
+# Parámetros de histéresis para lentes (puedes ajustar estos 2 valores si cambias de iluminación)
+UMBRAL_LENTES_ON = 0.48   # Puntaje para activar "Con Lentes"
+UMBRAL_LENTES_OFF = 0.34  # Puntaje mínimo para mantenerlo activo sin parpadear
 
-face_cascade = cv2.CascadeClassifier(rutas_xml["face"])
-glasses_cascade = cv2.CascadeClassifier(rutas_xml["glasses"])
+estado_lentes_bloqueado = False
+historial_lentes = deque(maxlen=5)
+historial_mascarilla = deque(maxlen=5)
 
-historial_lentes = deque(maxlen=4)
-historial_mascarilla = deque(maxlen=4)
 
 @app.get("/")
 def raiz():
-    return {"status": "online", "mensaje": "Backend Modular de Visión Artificial Operativo"}
+    return {"status": "online", "mensaje": "Backend MediaPipe FaceMesh + Hands Operativo"}
 
-def detectar_rostro_base(gray_eq, ancho_img, alto_img):
-    rostros = face_cascade.detectMultiScale(gray_eq, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
-    if len(rostros) > 0:
-        return max(rostros, key=lambda r: r[2] * r[3]), False
 
-    ojos = glasses_cascade.detectMultiScale(gray_eq, scaleFactor=1.1, minNeighbors=4, minSize=(18, 18))
-    if len(ojos) >= 2:
-        ojos_ord = sorted(ojos, key=lambda e: e[0])[:2]
-        ex1, ey1, ew1, eh1 = ojos_ord[0]
-        ex2, ey2, ew2, eh2 = ojos_ord[1]
-        if abs(ey1 - ey2) < 25 and (ex2 - ex1) > 15:
-            cx = (ex1 + ex2 + ew2) // 2
-            cy = (ey1 + ey2) // 2
-            aw = int((ex2 + ew2 - ex1) * 1.55)
-            ah = int(aw * 1.25)
-            rx = max(0, cx - aw // 2)
-            ry = max(0, cy - int(ah * 0.35))
-            return (rx, ry, min(ancho_img - rx, aw), min(alto_img - ry, ah)), True
-    return None, False
+def recorte_seguro(img, x1, y1, x2, y2):
+    h, w = img.shape[:2]
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(w, int(x2)), min(h, int(y2))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return img[y1:y2, x1:x2]
 
-def analizar_lentes(frame, gray, x, y, w, h):
-    ly1, ly2 = y + int(h * 0.31), y + int(h * 0.53)
-    lx1, lx2 = x + int(w * 0.14), x + int(w * 0.86)
-    zona_lentes_gray = gray[ly1:ly2, lx1:lx2]
-    zona_lentes_bgr = frame[ly1:ly2, lx1:lx2]
 
-    roi_frente_gray = gray[y + int(h * 0.08) : y + int(h * 0.20), x + int(w * 0.30) : x + int(w * 0.70)]
-    roi_frente_bgr = frame[y + int(h * 0.08) : y + int(h * 0.20), x + int(w * 0.30) : x + int(w * 0.70)]
+def fuerza_borde_horizontal(parche_gray):
+    """Mide bordes horizontales (puente, marcos superior/inferior, patillas) filtrando sombras verticales."""
+    if parche_gray is None or parche_gray.size < 12:
+        return 0.0
+    sobel_y = np.abs(cv2.Sobel(parche_gray, cv2.CV_64F, 0, 1, ksize=3))
+    sobel_x = np.abs(cv2.Sobel(parche_gray, cv2.CV_64F, 1, 0, ksize=3))
+    # Restamos gradiente horizontal (sobel_x) para ignorar sombras laterales de ventanas
+    neto = np.percentile(sobel_y, 85) - 0.50 * np.percentile(sobel_x, 85)
+    return float(max(0.0, neto))
 
-    if zona_lentes_gray.size == 0 or roi_frente_gray.size == 0:
-        return False, None
 
-    brillo_frente = float(np.mean(roi_frente_gray))
-    zh, zw = zona_lentes_gray.shape
+def analizar_lentes_estable(gray, landmarks, ancho_img, alto_img, ancho_rostro):
+    """Calcula un puntaje continuo (0.0 a 1.0) sobre 4 partes anatómicas de los lentes."""
+    global estado_lentes_bloqueado
 
-    calidez_frente = float(np.mean(roi_frente_bgr[:, :, 2]) - np.mean(roi_frente_bgr[:, :, 0]))
-    calidez_lentes = float(np.mean(zona_lentes_bgr[:, :, 2]) - np.mean(zona_lentes_bgr[:, :, 0]))
-    reflejo_cristal = calidez_frente - calidez_lentes
+    # Centros reales de ambos ojos (párpado superior 159/386 e inferior 145/374)
+    ojo_izq_x = ((landmarks[33].x + landmarks[133].x) / 2.0) * ancho_img
+    ojo_izq_y = ((landmarks[159].y + landmarks[145].y) / 2.0) * alto_img
+    ojo_der_x = ((landmarks[362].x + landmarks[263].x) / 2.0) * ancho_img
+    ojo_der_y = ((landmarks[386].y + landmarks[374].y) / 2.0) * alto_img
+    centro_ojos_y = (ojo_izq_y + ojo_der_y) / 2.0
 
-    mitad_baja_lentes = zona_lentes_gray[int(zh * 0.45):, :]
-    sobel_v = cv2.Sobel(mitad_baja_lentes, cv2.CV_64F, 0, 1, ksize=3)
-    borde_aro_inferior = float(np.percentile(np.abs(sobel_v), 88))
-
-    puente = zona_lentes_gray[int(zh * 0.10):int(zh * 0.65), int(zw * 0.40):int(zw * 0.60)]
-    caida_puente = brillo_frente - (float(np.percentile(puente, 15)) if puente.size > 0 else brillo_frente)
-
-    detectado = bool(
-        reflejo_cristal > 10.5 or
-        (caida_puente > 24.0 and borde_aro_inferior > 32.0)
+    # A) Puente nasal: franja exacta entre los lagrimales (133 y 362)
+    puente_x1 = landmarks[133].x * ancho_img
+    puente_x2 = landmarks[362].x * ancho_img
+    puente = recorte_seguro(
+        gray,
+        min(puente_x1, puente_x2),
+        centro_ojos_y - ancho_rostro * 0.055,
+        max(puente_x1, puente_x2),
+        centro_ojos_y + ancho_rostro * 0.045,
     )
-    return detectado, (lx1, ly1, lx2 - lx1, ly2 - ly1)
+    score_puente = min(1.0, fuerza_borde_horizontal(puente) / 34.0)
 
-def analizar_mascarilla_o_mano(frame, gray, x, y, w, h, usando_respaldo):
-    # Ventana centrada en los labios (del 62% al 88% del rostro, sin tocar la punta de la nariz)
-    my1, my2 = y + int(h * 0.62), y + int(h * 0.88)
-    mx1, mx2 = x + int(w * 0.26), x + int(w * 0.74)
-    roi_boca_bgr = frame[my1:my2, mx1:mx2]
-    roi_boca_gray = gray[my1:my2, mx1:mx2]
+    # B) Borde superior de la montura (entre párpado superior y ceja)
+    rx = ancho_rostro * 0.11
+    ry = ancho_rostro * 0.035
+    sup_izq = recorte_seguro(gray, ojo_izq_x - rx, ojo_izq_y - ancho_rostro * 0.075 - ry, ojo_izq_x + rx, ojo_izq_y - ancho_rostro * 0.075 + ry)
+    sup_der = recorte_seguro(gray, ojo_der_x - rx, ojo_der_y - ancho_rostro * 0.075 - ry, ojo_der_x + rx, ojo_der_y - ancho_rostro * 0.075 + ry)
+    score_superior = min(1.0, ((fuerza_borde_horizontal(sup_izq) + fuerza_borde_horizontal(sup_der)) / 2.0) / 38.0)
 
-    roi_frente_bgr = frame[y + int(h * 0.08) : y + int(h * 0.20), x + int(w * 0.30) : x + int(w * 0.70)]
+    # C) Aro inferior de la montura (debajo del párpado inferior)
+    inf_izq = recorte_seguro(gray, ojo_izq_x - rx, ojo_izq_y + ancho_rostro * 0.075 - ry, ojo_izq_x + rx, ojo_izq_y + ancho_rostro * 0.075 + ry)
+    inf_der = recorte_seguro(gray, ojo_der_x - rx, ojo_der_y + ancho_rostro * 0.075 - ry, ojo_der_x + rx, ojo_der_y + ancho_rostro * 0.075 + ry)
+    score_inferior = min(1.0, ((fuerza_borde_horizontal(inf_izq) + fuerza_borde_horizontal(inf_der)) / 2.0) / 30.0)
 
-    if roi_boca_bgr.size == 0 or roi_frente_bgr.size == 0:
-        return False, None
+    # D) Patillas en las sienes (entre esquina externa del ojo y borde lateral del rostro)
+    sien_izq_x = ((landmarks[33].x + landmarks[127].x) / 2.0) * ancho_img
+    sien_der_x = ((landmarks[263].x + landmarks[356].x) / 2.0) * ancho_img
+    pat_izq = recorte_seguro(gray, sien_izq_x - ancho_rostro * 0.05, ojo_izq_y - ancho_rostro * 0.05, sien_izq_x + ancho_rostro * 0.05, ojo_izq_y + ancho_rostro * 0.05)
+    pat_der = recorte_seguro(gray, sien_der_x - ancho_rostro * 0.05, ojo_der_y - ancho_rostro * 0.05, sien_der_x + ancho_rostro * 0.05, ojo_der_y + ancho_rostro * 0.05)
+    score_patillas = min(1.0, max(fuerza_borde_horizontal(pat_izq), fuerza_borde_horizontal(pat_der)) / 36.0)
 
-    # A) Mascarilla de tela (blanca KN95, celeste quirúrgica u oscura)
-    ycrcb_frente = cv2.cvtColor(roi_frente_bgr, cv2.COLOR_BGR2YCrCb)
-    cr_frente = np.mean(ycrcb_frente[:, :, 1])
-    cb_frente = np.mean(ycrcb_frente[:, :, 2])
-
-    ycrcb_boca = cv2.cvtColor(roi_boca_bgr, cv2.COLOR_BGR2YCrCb)
-    diff_cr = np.abs(ycrcb_boca[:, :, 1].astype(np.float32) - cr_frente)
-    diff_cb = np.abs(ycrcb_boca[:, :, 2].astype(np.float32) - cb_frente)
-    ratio_misma_piel = np.mean((diff_cr < 20) & (diff_cb < 20))
-    mascarilla_tela = ratio_misma_piel < 0.38
-
-    # B) Detección de línea de labios descubiertos vs mano tapando:
-    # Promediamos horizontalmente cada fila de la zona de la boca para detectar la depresión oscura de los labios.
-    # Con boca descubierta existe una caída brusca de brillo en el centro respecto a los bordes superior/inferior (perfil_caida > 22).
-    # Cuando la mano tapa, los dedos cruzan horizontalmente de borde a borde con brillo uniforme (perfil_caida < 16).
-    perfil_vertical = np.mean(roi_boca_gray, axis=1)
-    caida_linea_labios = float(np.max(perfil_vertical) - np.min(perfil_vertical))
-
-    # También medimos el contraste local entre el centro de los labios y las comisuras
-    hb, wb = roi_boca_gray.shape
-    centro_labios = roi_boca_gray[int(hb * 0.20):int(hb * 0.80), int(wb * 0.20):int(wb * 0.80)]
-    sombra_labios = float(np.percentile(centro_labios, 85) - np.percentile(centro_labios, 10))
-
-    mano_tapando = bool(
-        usando_respaldo or
-        (caida_linea_labios < 17.5 and sombra_labios < 26.0)
+    # Puntaje ponderado total
+    puntaje_total = (
+        0.35 * score_puente +
+        0.25 * score_superior +
+        0.25 * score_inferior +
+        0.15 * score_patillas
     )
 
-    detectado = bool(mascarilla_tela or mano_tapando)
-    return detectado, (mx1, my1, mx2 - mx1, my2 - my1)
+    # Histéresis para evitar que parpadee al inclinar ligeramente la cabeza
+    if estado_lentes_bloqueado:
+        if puntaje_total < UMBRAL_LENTES_OFF:
+            estado_lentes_bloqueado = False
+    else:
+        if puntaje_total >= UMBRAL_LENTES_ON:
+            estado_lentes_bloqueado = True
+
+    # Recuadro visual centrado exactamente en los ojos y lunas
+    x1 = int(min(landmarks[127].x, landmarks[356].x) * ancho_img)
+    x2 = int(max(landmarks[127].x, landmarks[356].x) * ancho_img)
+    y1 = int(centro_ojos_y - ancho_rostro * 0.13)
+    y2 = int(centro_ojos_y + ancho_rostro * 0.13)
+    rect_lentes = (max(0, x1), max(0, y1), max(1, x2 - x1), max(1, y2 - y1))
+
+    return estado_lentes_bloqueado, rect_lentes
+
+
+def analizar_mascarilla_y_mano(frame, landmarks, resultados_manos, ancho_img, alto_img, ancho_rostro):
+    """Combina detección de color (mascarilla/objeto) + detección real de mano con MediaPipe Hands."""
+    # Referencia de piel limpia en la frente (punto 10)
+    fx, fy = landmarks[10].x * ancho_img, landmarks[10].y * alto_img
+    r_frente = ancho_rostro * 0.08
+    frente_bgr = recorte_seguro(frame, fx - r_frente, fy - r_frente, fx + r_frente, fy + r_frente)
+
+    # Zona inferior del rostro (desde tabique medio 195 hasta debajo del mentón 152)
+    mx1 = int(min(landmarks[205].x, landmarks[425].x) * ancho_img)
+    mx2 = int(max(landmarks[205].x, landmarks[425].x) * ancho_img)
+    my1 = int(landmarks[195].y * alto_img)
+    my2 = int(min(alto_img, landmarks[152].y * alto_img + ancho_rostro * 0.05))
+    zona_mascarilla_bgr = recorte_seguro(frame, mx1, my1, mx2, my2)
+
+    if frente_bgr is None or zona_mascarilla_bgr is None:
+        return False, None
+
+    # 1. Prueba de Mascarilla / Objeto (celular, tela, KN95): compara tono de piel en espacio YCrCb
+    ycrcb_frente = cv2.cvtColor(frente_bgr, cv2.COLOR_BGR2YCrCb)
+    cr_frente = float(np.mean(ycrcb_frente[:, :, 1]))
+    cb_frente = float(np.mean(ycrcb_frente[:, :, 2]))
+
+    ycrcb_masc = cv2.cvtColor(zona_mascarilla_bgr, cv2.COLOR_BGR2YCrCb)
+    diff_cr = np.abs(ycrcb_masc[:, :, 1].astype(np.float32) - cr_frente)
+    diff_cb = np.abs(ycrcb_masc[:, :, 2].astype(np.float32) - cb_frente)
+    ratio_piel_inferior = float(np.mean((diff_cr < 22) & (diff_cb < 22)))
+
+    tiene_mascarilla_u_objeto = ratio_piel_inferior < 0.48
+
+    # 2. Prueba directa de Mano cubriendo la boca usando MediaPipe Hands
+    mano_sobre_boca = False
+    if resultados_manos.multi_hand_landmarks:
+        # Área de impacto alrededor de nariz y boca con margen de seguridad
+        zona_x1 = (min(landmarks[234].x, landmarks[454].x) * ancho_img) - ancho_rostro * 0.08
+        zona_x2 = (max(landmarks[234].x, landmarks[454].x) * ancho_img) + ancho_rostro * 0.08
+        zona_y1 = landmarks[6].y * alto_img  # Desde el puente nasal hacia abajo
+        zona_y2 = (landmarks[152].y * alto_img) + ancho_rostro * 0.15
+
+        for mano in resultados_manos.multi_hand_landmarks:
+            puntos_dentro = 0
+            for lm in mano.landmark:
+                hx = lm.x * ancho_img
+                hy = lm.y * alto_img
+                if zona_x1 <= hx <= zona_x2 and zona_y1 <= hy <= zona_y2:
+                    puntos_dentro += 1
+            # Si al menos 2 articulaciones de la mano están frente a la boca/nariz
+            if puntos_dentro >= 2:
+                mano_sobre_boca = True
+                break
+
+    detectado = bool(tiene_mascarilla_u_objeto or mano_sobre_boca)
+    rect_mascarilla = (max(0, mx1), max(0, my1), max(1, mx2 - mx1), max(1, my2 - my1))
+    return detectado, rect_mascarilla
+
 
 @app.post("/api/detectar")
 async def detectar(file: UploadFile = File(...), modo: str = Form("rostro")):
+    global estado_lentes_bloqueado
+
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
     frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if frame is None:
-        return {"rostro_detectado": False, "con_lentes": False, "con_mascarilla": False, "confianza": 0, "caja": None, "caja_detalle": None}
+        return {
+            "rostro_detectado": False,
+            "con_lentes": False,
+            "con_mascarilla": False,
+            "confianza": 0,
+            "caja": None,
+            "caja_detalle": None,
+        }
 
     alto_img, ancho_img, _ = frame.shape
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray_eq = cv2.equalizeHist(gray)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    rostro_caja, usando_respaldo = detectar_rostro_base(gray_eq, ancho_img, alto_img)
+    resultados_rostro = face_mesh.process(rgb)
 
-    if rostro_caja is None:
+    if not resultados_rostro.multi_face_landmarks:
         historial_lentes.clear()
         historial_mascarilla.clear()
-        return {"rostro_detectado": False, "con_lentes": False, "con_mascarilla": False, "confianza": 0, "caja": None, "caja_detalle": None}
+        estado_lentes_bloqueado = False
+        return {
+            "rostro_detectado": False,
+            "con_lentes": False,
+            "con_mascarilla": False,
+            "confianza": 0,
+            "caja": None,
+            "caja_detalle": None,
+        }
 
-    x, y, w, h = rostro_caja
+    # Solo ejecutamos detección de manos cuando hay rostro (y especialmente útil en modo mascarilla/rostro)
+    resultados_manos = hands_detector.process(rgb)
 
-    raw_lentes, rect_lentes = analizar_lentes(frame, gray, x, y, w, h)
+    landmarks = resultados_rostro.multi_face_landmarks[0].landmark
+
+    xs = [lm.x for lm in landmarks]
+    ys = [lm.y for lm in landmarks]
+    min_x, max_x = max(0.0, min(xs)), min(1.0, max(xs))
+    min_y, max_y = max(0.0, min(ys)), min(1.0, max(ys))
+
+    ancho_rostro = max(20.0, abs(landmarks[454].x - landmarks[234].x) * ancho_img)
+
+    raw_lentes, rect_lentes = analizar_lentes_estable(gray, landmarks, ancho_img, alto_img, ancho_rostro)
     historial_lentes.append(raw_lentes)
-    con_lentes = sum(historial_lentes) >= 2
+    con_lentes = sum(historial_lentes) >= 3
 
-    raw_mascarilla, rect_mascarilla = analizar_mascarilla_o_mano(frame, gray, x, y, w, h, usando_respaldo)
+    raw_mascarilla, rect_mascarilla = analizar_mascarilla_y_mano(
+        frame, landmarks, resultados_manos, ancho_img, alto_img, ancho_rostro
+    )
     historial_mascarilla.append(raw_mascarilla)
     con_mascarilla = sum(historial_mascarilla) >= 2
 
     caja_detalle = None
     if modo == "lentes" and rect_lentes:
         lx, ly, lw, lh = rect_lentes
-        caja_detalle = {"x": round(lx / ancho_img, 4), "y": round(ly / alto_img, 4), "w": round(lw / ancho_img, 4), "h": round(lh / alto_img, 4)}
+        caja_detalle = {
+            "x": round(lx / ancho_img, 4),
+            "y": round(ly / alto_img, 4),
+            "w": round(lw / ancho_img, 4),
+            "h": round(lh / alto_img, 4),
+        }
     elif modo == "mascarilla" and rect_mascarilla:
         mx, my, mw, mh = rect_mascarilla
-        caja_detalle = {"x": round(mx / ancho_img, 4), "y": round(my / alto_img, 4), "w": round(mw / ancho_img, 4), "h": round(mh / alto_img, 4)}
+        caja_detalle = {
+            "x": round(mx / ancho_img, 4),
+            "y": round(my / alto_img, 4),
+            "w": round(mw / ancho_img, 4),
+            "h": round(mh / alto_img, 4),
+        }
 
     caja_normalizada = {
-        "x": round(float(x / ancho_img), 4),
-        "y": round(float(y / alto_img), 4),
-        "w": round(float(w / ancho_img), 4),
-        "h": round(float(h / alto_img), 4),
+        "x": round(float(min_x), 4),
+        "y": round(float(min_y), 4),
+        "w": round(float(max_x - min_x), 4),
+        "h": round(float(max_y - min_y), 4),
     }
 
     return {
         "rostro_detectado": True,
         "con_lentes": bool(con_lentes),
         "con_mascarilla": bool(con_mascarilla),
-        "confianza": 0.98,
+        "confianza": 0.99,
         "caja": caja_normalizada,
-        "caja_detalle": caja_detalle
+        "caja_detalle": caja_detalle,
     }
